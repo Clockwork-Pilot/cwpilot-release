@@ -16,9 +16,10 @@ set -eu
 # written and exercised before the real hosting is decided. Once it is, update the
 # defaults here -- this is the one place they live.
 # ─────────────────────────────────────────────────────────────────────────────────
-REPOSITORY="${CWPILOT_REPOSITORY:-YuraLitvinov/binstore}"                                  
+REPOSITORY="${CWPILOT_REPOSITORY:-Clockwork-Pilot/cwpilot-release}"
 BASE_URL="${CWPILOT_RELEASE_BASE_URL:-https://github.com/${REPOSITORY}/releases}"
 PREFIX="${CWPILOT_INSTALL_PREFIX:-${HOME:-}/.local/bin}"
+VERSIONS_DIR="${CWPILOT_VERSIONS_DIR:-${HOME:-}/.local/share/cwpilot-versions}"
 TIMEOUT_SECONDS="${CWPILOT_INSTALL_TIMEOUT:-60}"
 VERSION="${CWPILOT_VERSION:-}"
 FORCE=0
@@ -50,8 +51,10 @@ Usage: install.sh [VERSION] [--prefix DIRECTORY] [--force]
 
 Installs cwpilot from the Clockwork-Pilot release assets.
 
-VERSION is a positional release tag such as 0.0.1. It defaults to "latest" when
-omitted (or CWPILOT_VERSION is unset), which pins to no particular release.
+VERSION is a positional release tag such as v0.0.1 (a bare 0.0.1 is also accepted
+and normalized to the v-prefixed tag). It defaults to "latest" when omitted (or
+CWPILOT_VERSION is unset), which resolves to whatever release GitHub currently
+marks latest -- re-resolved on every run, not cached under its own alias.
 
 Re-running updates the stable link; --force re-downloads the requested version.
 EOF
@@ -69,15 +72,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# ── Platform: Linux/Darwin x x86_64/arm64 ───────────────────────────────────────
-# system is uname -s VERBATIM -- Linux, Darwin -- matching the <platform> keys
-# scripts/find-binary.sh's platform_tag() and binaries.lock use, so a
-# manually-placed cache entry and an install.sh download agree on the same name.
-# arch is still normalized: uname -m spells the same CPU family differently
-# across tools (amd64 vs x86_64, aarch64 vs arm64), so that half can't be raw.
 system="$(uname -s)"
+system="$(printf '%s' "$system" | tr '[:upper:]' '[:lower:]')"
 case "$system" in
-    Linux|Darwin) ;;
+    linux|darwin) ;;
     *) echo "error: unsupported OS: $system" >&2; exit 1 ;;
 esac
 
@@ -88,43 +86,8 @@ case "$(uname -m)" in
 esac
 
 PLATFORM="${system}-${arch}"
-
-# ── Version: "latest" unless a specific release is requested ────────────────────
-if [ -z "$VERSION" ]; then
-    VERSION=latest
-fi
-
-# GitHub release URLs: the "latest" alias lives under releases/latest/download/, while
-# a specific release lives under releases/download/<tag>/ -- and this repo's tags are
-# bare versions (0.0.1), not v-prefixed, so no "v" belongs in the URL.
-#   https://github.com/YuraLitvinov/binstore/releases/latest/download/cwpilot-Linux-x86_64
-#   https://github.com/YuraLitvinov/binstore/releases/download/0.0.1/cwpilot-Linux-x86_64
-if [ "$VERSION" = latest ]; then
-    RELEASE_URL="${BASE_URL}/latest/download"
-else
-    VERSION="${VERSION#v}"
-    # VERSION becomes a directory name below. Reject path traversal rather than
-    # allowing an option intended to select a release to escape the install cache.
-    case "$VERSION" in
-        ''|.|..|*/*) echo "error: invalid version: ${VERSION}" >&2; exit 2 ;;
-    esac
-    RELEASE_URL="${BASE_URL}/download/${VERSION}"
-fi
-
-# GitHub computes and stores a sha256 "digest" for every uploaded release asset --
-# it's already in the release, so there's no need to also publish (and fetch) a
-# separate *.sha256 sidecar file. The digest is only exposed through the REST API,
-# not the plain releases/download/... URLs used above for the binary and signature.
-if [ "$VERSION" = latest ]; then
-    API_URL="https://api.github.com/repos/${REPOSITORY}/releases/latest"
-else
-    API_URL="https://api.github.com/repos/${REPOSITORY}/releases/tags/${VERSION}"
-fi
-
 ASSET="cwpilot-${PLATFORM}"
-destination="${PREFIX}/cwpilot"
-cache_dir="${PREFIX}/../cwpilot-versions/${VERSION}"
-cached_binary="${cache_dir}/cwpilot"
+
 tmpdir=""
 cache_tmp=""
 link_tmp=""
@@ -135,11 +98,87 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$PREFIX" "$cache_dir"
+ensure_tmpdir() {
+    [ -n "$tmpdir" ] || tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/cwpilot-install.XXXXXX")"
+}
+
+# Wraps curl with a message that names what failed to download and why, instead of
+# leaving the bare "curl: (22) The requested URL returned error: 404" to explain
+# itself -- that error alone doesn't say whether it was the binary, the signature,
+# or the release metadata that 404'd, or against which URL.
+fetch() {
+    description="$1"; url="$2"; out="$3"; shift 3
+    if ! curl --fail --silent --show-error --location --max-time "$TIMEOUT_SECONDS" \
+            "$@" "$url" -o "$out"; then
+        echo "error: failed to download ${description} from ${url}" >&2
+        exit 1
+    fi
+}
+
+# ── Version: resolve "latest" to the concrete tag it currently points at ────────
+# "latest" is a moving alias, not a cache key. Caching it under a directory literally
+# named "latest" would mean a later `install.sh` with no args never notices a new
+# release without --force, and would leave the same release duplicated on disk once
+# it's also installed by its explicit tag (e.g. both versions/latest/ and
+# versions/1.1.1/). So the alias is always resolved against the API first -- a small
+# JSON request, not the binary -- and everything downstream (cache directory, digest
+# lookup, download URL) uses the resolved tag, exactly like an explicit version.
+prefetched_metadata=""
+if [ -z "$VERSION" ] || [ "$VERSION" = latest ]; then
+    command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+    ensure_tmpdir
+    prefetched_metadata="${tmpdir}/release.json"
+    fetch "latest release metadata" "https://api.github.com/repos/${REPOSITORY}/releases/latest" \
+        "$prefetched_metadata" -H "Accept: application/vnd.github+json"
+
+    # Same pretty-printed-JSON, no-parser-needed approach as extract_digest below:
+    # "tag_name" appears once, at the top level of the release object.
+    tag="$(awk '
+        /"tag_name":/ {
+            line = $0
+            sub(/^[^"]*"tag_name": *"/, "", line)
+            sub(/".*$/, "", line)
+            print line
+            exit
+        }
+    ' "$prefetched_metadata")"
+    [ -n "$tag" ] || {
+        echo "error: no tag_name found in latest release metadata" >&2
+        exit 1
+    }
+    VERSION="$tag"
+fi
+
+# This repo's tags are v-prefixed (v1.0.0), not bare versions -- and GitHub's tag
+# and download URLs need the literal tag, so a version typed without the "v" (e.g.
+# "1.0.0") is normalized to match it. Resolved-from-latest and explicitly-typed
+# versions both go through this, so "latest" and "v1.0.0"/"1.0.0" converge on the
+# exact same string and therefore the same cache directory -- no duplicate installs
+# of the same release under two different-looking names.
+case "$VERSION" in
+    v*) ;;
+    *) VERSION="v${VERSION}" ;;
+esac
+
+# VERSION becomes a directory name below. Reject path traversal rather than allowing
+# an option (or an API response) intended to select a release to escape the install
+# cache.
+case "$VERSION" in
+    v|*/*) echo "error: invalid version: ${VERSION}" >&2; exit 2 ;;
+esac
+
+RELEASE_URL="${BASE_URL}/download/${VERSION}"
+API_URL="https://api.github.com/repos/${REPOSITORY}/releases/tags/${VERSION}"
+
+destination="${PREFIX}/cwpilot"
+cwpilot_version="${VERSIONS_DIR}/${VERSION}"
+cached_binary="${cwpilot_version}/cwpilot"
+
+mkdir -p "$PREFIX" "$cwpilot_version"
 
 # A previous version rejected an existing destination with "already exists (use
-# --force)". The cache is now keyed by version, so a cached release can be reused and
-# the stable link below can always move to the requested version.
+# --force)". The cache is now keyed by (resolved) version, so a cached release can be
+# reused and the stable link below can always move to the requested version.
 if [ "$FORCE" -ne 1 ] && [ -f "$cached_binary" ]; then
     chmod 0755 "$cached_binary"
 else
@@ -155,19 +194,6 @@ else
     command -v openssl >/dev/null 2>&1 || {
         echo "error: openssl is required to verify release signatures" >&2
         exit 1
-    }
-
-    # Wraps curl with a message that names what failed to download and why, instead of
-    # leaving the bare "curl: (22) The requested URL returned error: 404" to explain
-    # itself -- that error alone doesn't say whether it was the binary, the signature,
-    # or the release metadata that 404'd, or against which URL.
-    fetch() {
-        description="$1"; url="$2"; out="$3"; shift 3
-        if ! curl --fail --silent --show-error --location --max-time "$TIMEOUT_SECONDS" \
-                "$@" "$url" -o "$out"; then
-            echo "error: failed to download ${description} from ${url}" >&2
-            exit 1
-        fi
     }
 
     # The release JSON GitHub's API returns is pretty-printed one field per line, so a
@@ -196,14 +222,25 @@ else
         ' "$json_file"
     }
 
-    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/cwpilot-install.XXXXXX")"
+    ensure_tmpdir
     binary="${tmpdir}/${ASSET}"
     signature="${tmpdir}/${ASSET}.sig"
-    metadata="${tmpdir}/release.json"
     pubkey_file="${tmpdir}/signing.pub"
     fetch "release binary" "${RELEASE_URL}/${ASSET}" "$binary"
     fetch "release signature" "${RELEASE_URL}/${ASSET}.sig" "$signature"
-    fetch "release metadata" "$API_URL" "$metadata" -H "Accept: application/vnd.github+json"
+
+    # GitHub computes and stores a sha256 "digest" for every uploaded release asset --
+    # it's already in the release, so there's no need to also publish (and fetch) a
+    # separate *.sha256 sidecar file. The digest is only exposed through the REST API,
+    # not the plain releases/download/... URLs used above for the binary and signature.
+    # When VERSION was resolved from "latest" above, that request already pulled this
+    # same release's metadata -- reuse it instead of asking the API twice.
+    if [ -n "$prefetched_metadata" ]; then
+        metadata="$prefetched_metadata"
+    else
+        metadata="${tmpdir}/release.json"
+        fetch "release metadata" "$API_URL" "$metadata" -H "Accept: application/vnd.github+json"
+    fi
 
     expected="$(extract_digest "$metadata" "$ASSET")"
     [ -n "$expected" ] || {
@@ -242,9 +279,10 @@ else
 fi
 
 # Replace the stable link in one rename. Readers see the old version or the new one,
-# never the gap that ln -sfn would create. The relative target keeps the whole install
-# tree relocatable and leaves every older versioned directory available for rollback.
+# never the gap that ln -sfn would create. The target is absolute since VERSIONS_DIR
+# (~/.local/share/cwpilot-versions) need not share a parent with PREFIX, and every
+# older versioned directory stays in place for rollback.
 link_tmp="${destination}.link.$$"
-ln -s "../cwpilot-versions/${VERSION}/cwpilot" "$link_tmp"
+ln -s "${cwpilot_version}/cwpilot" "$link_tmp"
 mv -f "$link_tmp" "$destination"
 echo "installed cwpilot ${VERSION} (${PLATFORM}) to ${destination}"

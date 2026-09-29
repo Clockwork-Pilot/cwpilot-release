@@ -8,6 +8,12 @@
 # openssl RSA signature over the binary is the actual trust control -- an attacker who
 # can replace the binary can replace its checksum file too, but cannot forge a
 # signature without the private key. There is no flag to skip the signature check.
+#
+# openssl specifically (not cosign, not anything else) because this script is piped
+# through `curl | sh` onto a bare machine with no install step of its own -- openssl
+# ships preinstalled on macOS and virtually every desktop Linux distro, so the
+# signature check works out of the box instead of adding a dependency this installer
+# would then have to install itself.
 set -eu
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -56,7 +62,15 @@ and normalized to the v-prefixed tag). It defaults to "latest" when omitted (or
 CWPILOT_VERSION is unset), which resolves to whatever release GitHub currently
 marks latest -- re-resolved on every run, not cached under its own alias.
 
+VERSION may also be a bare major.minor (e.g. 0.1, or v0.1): resolves to that
+family's newest patch release, without ever crossing into a different major.minor
+on its own. Use this to stay on a chosen release line and only ever pick up patch
+updates; a full VERSION or the default "latest" are the only ways to move to a
+different major.minor.
+
 Re-running updates the stable link; --force re-downloads the requested version.
+Only the version just linked and whichever one was linked immediately before it
+are kept on disk -- one fallback to roll back to, not unbounded history.
 EOF
 }
 
@@ -115,6 +129,35 @@ fetch() {
     fi
 }
 
+# Given a full "GET .../releases" list response (pretty-printed JSON, one field per
+# line -- same shape the single-release lookups elsewhere in this script already
+# assume) and a bare "major.minor" family, prints that family's highest-patch tag, or
+# nothing if none match. Field-by-field comparison rather than a regex built from
+# `family`, so a literal "." in it is never accidentally treated as "any character".
+newest_patch_in_family() {
+    json_file="$1"; family="$2"
+    awk -v family="$family" '
+        BEGIN { split(family, f, "."); fmajor = f[1]; fminor = f[2] }
+        /"tag_name":/ {
+            line = $0
+            sub(/^[^"]*"tag_name": *"/, "", line)
+            sub(/".*$/, "", line)
+            tag = line
+            bare = tag
+            sub(/^v/, "", bare)
+            nf = split(bare, parts, ".")
+            if (nf == 3 && parts[1] == fmajor && parts[2] == fminor && parts[3] ~ /^[0-9]+$/) {
+                patch = parts[3] + 0
+                if (best_tag == "" || patch > best_patch) {
+                    best_patch = patch
+                    best_tag = tag
+                }
+            }
+        }
+        END { if (best_tag != "") print best_tag }
+    ' "$json_file"
+}
+
 # ── Version: resolve "latest" to the concrete tag it currently points at ────────
 # "latest" is a moving alias, not a cache key. Caching it under a directory literally
 # named "latest" would mean a later `install.sh` with no args never notices a new
@@ -147,6 +190,32 @@ if [ -z "$VERSION" ] || [ "$VERSION" = latest ]; then
         exit 1
     }
     VERSION="$tag"
+else
+    # A bare major.minor (exactly one dot once any "v" is stripped, e.g. "0.1" or
+    # "v0.1") resolves to that family's newest patch via the full release list --
+    # "major.minor" can't exist as a literal tag. A full major.minor.patch (two dots)
+    # falls straight through, normalized below exactly as before; this is the only
+    # new shape.
+    bare="${VERSION#v}"
+    case "$bare" in
+        *.*.*) ;;
+        *.*)
+            command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+            ensure_tmpdir
+            family_list="${tmpdir}/releases.json"
+            # The default page (30 releases) is assumed to cover this family -- fine
+            # for a project this young; revisit with ?per_page=/pagination once release
+            # history outgrows one page.
+            fetch "release list" "https://api.github.com/repos/${REPOSITORY}/releases" \
+                "$family_list" -H "Accept: application/vnd.github+json"
+            resolved="$(newest_patch_in_family "$family_list" "$bare")"
+            [ -n "$resolved" ] || {
+                echo "error: no release found for ${bare}.x in ${REPOSITORY}" >&2
+                exit 1
+            }
+            VERSION="$resolved"
+            ;;
+    esac
 fi
 
 # This repo's tags are v-prefixed (v1.0.0), not bare versions -- and GitHub's tag
@@ -278,11 +347,40 @@ else
     mv -f "$cache_tmp" "$cached_binary"
 fi
 
+# Capture what the stable link currently points at, BEFORE it moves, so it can be kept
+# as the rollback fallback below. Only trusted when it actually points inside
+# VERSIONS_DIR -- anything else (missing, a plain file, a foreign path) means there's
+# no known-previous version to protect from pruning.
+previous_version=""
+if [ -L "$destination" ]; then
+    prev_target="$(readlink "$destination")"
+    case "$prev_target" in
+        "${VERSIONS_DIR}"/*/cwpilot)
+            previous_version="${prev_target#"${VERSIONS_DIR}"/}"
+            previous_version="${previous_version%/cwpilot}"
+            ;;
+    esac
+fi
+
 # Replace the stable link in one rename. Readers see the old version or the new one,
 # never the gap that ln -sfn would create. The target is absolute since VERSIONS_DIR
-# (~/.local/share/cwpilot-versions) need not share a parent with PREFIX, and every
-# older versioned directory stays in place for rollback.
+# (~/.local/share/cwpilot-versions) need not share a parent with PREFIX.
 link_tmp="${destination}.link.$$"
 ln -s "${cwpilot_version}/cwpilot" "$link_tmp"
 mv -f "$link_tmp" "$destination"
 echo "installed cwpilot ${VERSION} (${PLATFORM}) to ${destination}"
+
+# Retention: keep only the version just linked and whichever one was linked
+# immediately before it -- current + previous, exactly one fallback to roll back to
+# if the new install turns out to be bad, with no unbounded growth. Nothing to prune
+# when they're the same version (e.g. a same-version --force re-run) -- there both is
+# and only ever was one copy on disk.
+if [ -n "${previous_version}" ] && [ "${previous_version}" != "${VERSION}" ] && [ -d "${VERSIONS_DIR}" ]; then
+    for dir in "${VERSIONS_DIR}"/*; do
+        [ -d "${dir}" ] || continue
+        case "$(basename "${dir}")" in
+            "${VERSION}" | "${previous_version}") ;;
+            *) rm -rf "${dir}" ;;
+        esac
+    done
+fi

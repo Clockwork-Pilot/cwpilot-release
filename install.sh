@@ -29,6 +29,10 @@ VERSIONS_DIR="${CWPILOT_VERSIONS_DIR:-${HOME:-}/.local/share/cwpilot-versions}"
 TIMEOUT_SECONDS="${CWPILOT_INSTALL_TIMEOUT:-60}"
 VERSION="${CWPILOT_VERSION:-}"
 FORCE=0
+# hookrunner is released from the public plugin repo, not the cwpilot release repo.
+HOOKRUNNER_REPOSITORY="${HOOKRUNNER_REPOSITORY:-Clockwork-Pilot/code-plugin}"
+HOOKRUNNER_BASE_URL="${HOOKRUNNER_RELEASE_BASE_URL:-https://github.com/${HOOKRUNNER_REPOSITORY}/releases}"
+HOOKRUNNER_VERSION=""
 
 # The RSA public key releases are signed with, as PEM (SubjectPublicKeyInfo). Embedded
 # literally -- not read from a sibling file -- because this script must work piped
@@ -54,8 +58,16 @@ vOipVXWeyt0DjfsGpSmBi/MCAwEAAQ==
 usage() {
     cat <<EOF
 Usage: install.sh [VERSION] [--prefix DIRECTORY] [--force]
+       install.sh --hookrunner VERSION [--force]
 
 Installs cwpilot from the Clockwork-Pilot release assets.
+
+--hookrunner VERSION installs the plugin's hookrunner binary instead (and only that):
+VERSION is the plugin release, e.g. 1.2.0 or v1.2.0, with no "latest" or major.minor
+shorthand -- the plugin names the exact version it was built with. It is verified
+against the same signature key and stored, with its .sig, next to the cwpilot
+versions as <versions dir>/hookrunner-v<VERSION>/hookrunner. The newest two such
+directories are kept. cwpilot itself is left untouched.
 
 VERSION is a positional release tag such as v0.0.1 (a bare 0.0.1 is also accepted
 and normalized to the v-prefixed tag). It defaults to "latest" when omitted (or
@@ -80,6 +92,9 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || { echo "error: --prefix needs a value" >&2; exit 2; }
             PREFIX="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
+        --hookrunner)
+            [ "$#" -ge 2 ] || { echo "error: --hookrunner needs a version" >&2; exit 2; }
+            HOOKRUNNER_VERSION="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         --*) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
         *) VERSION="$1"; shift ;;
@@ -128,6 +143,101 @@ fetch() {
         exit 1
     fi
 }
+
+# Verify $1 (a file) against detached signature $2 with the embedded public key (or the
+# key file CWPILOT_SIGNING_PUBKEY names -- for testing against a self-signed release, or
+# after a key rotation lands upstream faster than this script does; it names a KEY FILE,
+# never disables the check). Exits the whole script on any failure: nothing unverified is
+# ever installed.
+verify_signature() {
+    vs_file="$1"; vs_sig="$2"
+    command -v openssl >/dev/null 2>&1 || {
+        echo "error: openssl is required to verify release signatures" >&2
+        exit 1
+    }
+    ensure_tmpdir
+    if [ -n "${CWPILOT_SIGNING_PUBKEY:-}" ]; then
+        [ -f "$CWPILOT_SIGNING_PUBKEY" ] || {
+            echo "error: CWPILOT_SIGNING_PUBKEY does not exist: ${CWPILOT_SIGNING_PUBKEY}" >&2
+            exit 1
+        }
+        vs_key="$CWPILOT_SIGNING_PUBKEY"
+    else
+        vs_key="${tmpdir}/signing.pub"
+        printf '%s\n' "$PUBKEY_PEM" > "$vs_key"
+    fi
+    if ! openssl dgst -sha256 -verify "$vs_key" -signature "$vs_sig" "$vs_file" >/dev/null 2>&1; then
+        echo "error: signature verification failed for $(basename "$vs_file") -- refusing to install" >&2
+        exit 1
+    fi
+}
+
+# Keep the embedded public key at <versions dir>/signing.pub, beside the .sig files, so
+# anything that re-checks an installed binary later has the key without needing this
+# script. Rewritten on every run (so a rotation here reaches it) and atomically. Never
+# written from CWPILOT_SIGNING_PUBKEY: that override is for testing, and must not become
+# the stored trust root.
+store_public_key() {
+    [ -z "${CWPILOT_SIGNING_PUBKEY:-}" ] || return 0
+    mkdir -p "$VERSIONS_DIR"
+    key_tmp="${VERSIONS_DIR}/signing.pub.tmp.$$"
+    printf '%s\n' "$PUBKEY_PEM" > "$key_tmp"
+    chmod 0644 "$key_tmp"
+    mv -f "$key_tmp" "${VERSIONS_DIR}/signing.pub"
+}
+
+# ── hookrunner: a different binary from a different repo, installed on its own ───
+# Exact version only (the plugin names the one it was built with); no GitHub API call,
+# so none of its rate limit either. Both files are downloaded and the signature is
+# verified BEFORE anything lands in the versions directory, and the .sig is stored
+# beside the binary (written first, so a binary is never present without its sig).
+if [ -n "$HOOKRUNNER_VERSION" ]; then
+    command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+    case "$HOOKRUNNER_VERSION" in
+        v*) ;;
+        *) HOOKRUNNER_VERSION="v${HOOKRUNNER_VERSION}" ;;
+    esac
+    case "$HOOKRUNNER_VERSION" in
+        v|*/*|*..*) echo "error: invalid hookrunner version: ${HOOKRUNNER_VERSION}" >&2; exit 2 ;;
+    esac
+    # Only these platforms have a published hookrunner build; anywhere else the plugin
+    # simply keeps running its hooks from Python source, so say that instead of 404ing.
+    case "$PLATFORM" in
+        linux-x86_64|darwin-arm64) ;;
+        *)
+            echo "error: no hookrunner build is published for ${PLATFORM}; the plugin runs its hooks from Python source there" >&2
+            exit 1 ;;
+    esac
+    hr_asset="hookrunner-${PLATFORM}"
+    hr_dir="${VERSIONS_DIR}/hookrunner-${HOOKRUNNER_VERSION}"
+    if [ "$FORCE" -ne 1 ] && [ -f "${hr_dir}/hookrunner" ] && [ -f "${hr_dir}/hookrunner.sig" ]; then
+        store_public_key
+        echo "hookrunner ${HOOKRUNNER_VERSION} (${PLATFORM}) already installed at ${hr_dir}/hookrunner"
+        exit 0
+    fi
+    ensure_tmpdir
+    hr_url="${HOOKRUNNER_BASE_URL}/download/${HOOKRUNNER_VERSION}"
+    fetch "hookrunner binary" "${hr_url}/${hr_asset}" "${tmpdir}/${hr_asset}"
+    fetch "hookrunner signature" "${hr_url}/${hr_asset}.sig" "${tmpdir}/${hr_asset}.sig"
+    verify_signature "${tmpdir}/${hr_asset}" "${tmpdir}/${hr_asset}.sig"
+
+    mkdir -p "$hr_dir"
+    cache_tmp="${hr_dir}/hookrunner.tmp.$$"
+    cp "${tmpdir}/${hr_asset}.sig" "${hr_dir}/hookrunner.sig"
+    cp "${tmpdir}/${hr_asset}" "$cache_tmp"
+    chmod 0755 "$cache_tmp"
+    mv -f "$cache_tmp" "${hr_dir}/hookrunner"
+    store_public_key
+    echo "installed hookrunner ${HOOKRUNNER_VERSION} (${PLATFORM}) to ${hr_dir}/hookrunner"
+
+    # Keep the two most recently installed hookrunner versions: current + one to roll
+    # back to. Only hookrunner-v* directories -- never a cwpilot v* one.
+    ls -1dt "${VERSIONS_DIR}"/hookrunner-v* 2>/dev/null | tail -n +3 |
+        while IFS= read -r stale; do
+            [ -d "$stale" ] && rm -rf "$stale"
+        done
+    exit 0
+fi
 
 # Given a full "GET .../releases" list response (pretty-printed JSON, one field per
 # line -- same shape the single-release lookups elsewhere in this script already
@@ -250,6 +360,21 @@ mkdir -p "$PREFIX" "$cwpilot_version"
 # reused and the stable link below can always move to the requested version.
 if [ "$FORCE" -ne 1 ] && [ -f "$cached_binary" ]; then
     chmod 0755 "$cached_binary"
+    # A version cached before signatures were kept has no cwpilot.sig, and the plugin
+    # treats a binary with no signature as unverified. Backfill it WITHOUT re-downloading
+    # the binary: fetch the release's .sig and verify the cached file against it first,
+    # so a cached binary that is not the genuine release is refused, never blessed.
+    if [ ! -f "${cwpilot_version}/cwpilot.sig" ]; then
+        command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+        ensure_tmpdir
+        backfill_sig="${tmpdir}/${ASSET}.sig"
+        fetch "release signature" "${RELEASE_URL}/${ASSET}.sig" "$backfill_sig"
+        if ! verify_signature "$cached_binary" "$backfill_sig"; then
+            exit 1
+        fi
+        cp "$backfill_sig" "${cwpilot_version}/cwpilot.sig"
+        echo "stored the missing signature for cached cwpilot ${VERSION}"
+    fi
 else
     command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
     if command -v sha256sum >/dev/null 2>&1; then
@@ -260,11 +385,6 @@ else
         echo "error: sha256sum or shasum is required" >&2
         exit 1
     fi
-    command -v openssl >/dev/null 2>&1 || {
-        echo "error: openssl is required to verify release signatures" >&2
-        exit 1
-    }
-
     # The release JSON GitHub's API returns is pretty-printed one field per line, so a
     # small state machine tracking the most recently seen "name" is enough to pull out
     # the matching asset's digest -- no JSON parser needed, which matters since this
@@ -294,7 +414,6 @@ else
     ensure_tmpdir
     binary="${tmpdir}/${ASSET}"
     signature="${tmpdir}/${ASSET}.sig"
-    pubkey_file="${tmpdir}/signing.pub"
     fetch "release binary" "${RELEASE_URL}/${ASSET}" "$binary"
     fetch "release signature" "${RELEASE_URL}/${ASSET}.sig" "$signature"
 
@@ -322,30 +441,18 @@ else
         exit 1
     }
 
-    # CWPILOT_SIGNING_PUBKEY lets a different trust root be pointed at -- for testing
-    # against a self-signed release, or after a key rotation lands upstream faster than
-    # this script does. It names a KEY FILE, never disables the check.
-    if [ -n "${CWPILOT_SIGNING_PUBKEY:-}" ]; then
-        [ -f "$CWPILOT_SIGNING_PUBKEY" ] || {
-            echo "error: CWPILOT_SIGNING_PUBKEY does not exist: ${CWPILOT_SIGNING_PUBKEY}" >&2
-            exit 1
-        }
-        pubkey_file="$CWPILOT_SIGNING_PUBKEY"
-    else
-        printf '%s\n' "$PUBKEY_PEM" > "$pubkey_file"
-    fi
-
-    if ! openssl dgst -sha256 -verify "$pubkey_file" -signature "$signature" "$binary" >/dev/null 2>&1; then
-        echo "error: signature verification failed for ${ASSET} -- refusing to install" >&2
-        exit 1
-    fi
+    verify_signature "$binary" "$signature"
 
     chmod 0755 "$binary"
+    # The signature is kept beside the binary (written first, so a binary is never
+    # present without its sig) for anything that wants to re-check it later.
+    cp "$signature" "${cwpilot_version}/cwpilot.sig"
     cache_tmp="${cached_binary}.tmp.$$"
     cp "$binary" "$cache_tmp"
     chmod 0755 "$cache_tmp"
     mv -f "$cache_tmp" "$cached_binary"
 fi
+store_public_key
 
 # Capture what the stable link currently points at, BEFORE it moves, so it can be kept
 # as the rollback fallback below. Only trusted when it actually points inside
@@ -376,7 +483,9 @@ echo "installed cwpilot ${VERSION} (${PLATFORM}) to ${destination}"
 # when they're the same version (e.g. a same-version --force re-run) -- there both is
 # and only ever was one copy on disk.
 if [ -n "${previous_version}" ] && [ "${previous_version}" != "${VERSION}" ] && [ -d "${VERSIONS_DIR}" ]; then
-    for dir in "${VERSIONS_DIR}"/*; do
+    # Only cwpilot's own v* directories: hookrunner-v* ones (and anything else that
+    # shares this directory) are not this retention rule's to delete.
+    for dir in "${VERSIONS_DIR}"/v*; do
         [ -d "${dir}" ] || continue
         case "$(basename "${dir}")" in
             "${VERSION}" | "${previous_version}") ;;

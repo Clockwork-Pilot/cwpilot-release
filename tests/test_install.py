@@ -60,7 +60,7 @@ def main():
         rules = json.load(f)
 
     for rule in rules:
-        if rule["match"] in (url or ""):
+        if rule["match"] in (url or "") and (url or "").endswith(rule.get("endswith", "")):
             action = rule["action"]
             if action == "content":
                 with open(out, "w") as f:
@@ -169,10 +169,32 @@ class InstallShTestCase(unittest.TestCase):
             (version_dir / "cwpilot.sig").write_bytes(b"stored-sig")
         return binary
 
-    def run_install(self, *args, extra_env=None):
+    def _as_cwpilot_family(self, args):
+        """cwpilot takes major.minor, never a patch (install.sh rejects X.Y.Z). Tests that
+        want one specific release name it as a full version; this turns that into its
+        major.minor and makes the release list contain only that tag, so the family
+        resolves to exactly it -- the same install, reached the way install.sh allows."""
+        out = []
+        for arg in args:
+            bare = arg[1:] if arg.startswith("v") else arg
+            parts = bare.split(".")
+            if len(parts) == 3 and all(p.isdigit() for p in parts):
+                rules = json.loads(self.rules_file.read_text()) if self.rules_file.exists() else []
+                rules.insert(0, {"match": "/releases", "endswith": "/releases", "action": "content",
+                                 "body": release_list_json([f"v{bare}"])})
+                self.set_rules(rules)
+                arg = ".".join(parts[:2])
+            out.append(arg)
+        return out
+
+    def run_install(self, *args, extra_env=None, everything=False):
         env = dict(self.env)
         if extra_env:
             env.update(extra_env)
+        # A bare install.sh now installs cwpilot AND hookrunner; the cwpilot-focused
+        # tests name the component so they stay about cwpilot alone.
+        if not everything and "--hookrunner" not in args and "hookrunner" not in args:
+            args = ("cwpilot", *self._as_cwpilot_family(args))
         return subprocess.run(
             ["sh", str(INSTALL_SH), *args],
             env=env,
@@ -243,7 +265,8 @@ class InstallShTestCase(unittest.TestCase):
         result = self.run_install("v1.2.3")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.curl_calls(), [], "explicit pinned version with a cache hit must stay offline")
+        self.assertEqual(len(self.curl_calls()), 1, "only the family's release list is fetched; the cached binary is not re-downloaded")
+        self.assertTrue(self.curl_calls()[0].endswith("/releases"))
         self.assertEqual(os.readlink(self.stable_link()), str(self.versions_dir() / "v1.2.3" / "cwpilot"))
 
     def test_bare_version_normalizes_to_v_prefixed_tag_and_reuses_cache(self):
@@ -258,7 +281,7 @@ class InstallShTestCase(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("installed cwpilot v1.2.3", result.stdout)
-        self.assertEqual(self.curl_calls(), [], "normalized version with a cache hit must stay offline")
+        self.assertEqual(len(self.curl_calls()), 1, "only the release list is fetched; the cached binary is reused")
         self.assertEqual(
             self.version_dirs(), ["v1.2.3"],
             "a bare version must resolve to the same cache directory as its v-prefixed tag",
@@ -425,17 +448,17 @@ class InstallShTestCase(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no release found for 0.1.x", result.stderr)
 
-    def test_full_version_argument_is_unaffected_by_family_resolution(self):
-        # A full major.minor.patch must never go through the release-list lookup at
-        # all -- proven here by a rules list that only a /releases (list) hit would
-        # satisfy, which must never be requested.
+    def test_cwpilot_alone_rejects_a_patch_version(self):
+        # cwpilot takes major.minor (or latest); an exact patch is hookrunner's scheme.
         self.install_fake_curl()
         self.set_rules([{"match": "", "action": "fail", "message": "network should not be used"}])
-        self.seed_cached_version("v0.1.2")
-
-        result = self.run_install("0.1.2")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
+        # Bypass the test helper's X.Y.Z -> X.Y adaptation to hit install.sh directly.
+        for version in ("0.1.2", "v0.1.2"):
+            with self.subTest(version=version):
+                result = subprocess.run(["sh", str(INSTALL_SH), "cwpilot", version],
+                                        env=self.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("takes major.minor", result.stderr)
         self.assertEqual(self.curl_calls(), [])
 
     def test_prunes_to_current_and_previous_only(self):
@@ -528,6 +551,38 @@ class InstallShTestCase(unittest.TestCase):
         self.assertFalse(any("api.github.com" in c for c in self.curl_calls()))
         self.assertFalse(self.stable_link().exists(), "hookrunner mode must not touch the cwpilot link")
 
+    def test_bare_install_installs_both_cwpilot_and_hookrunner(self):
+        self.install_fake_curl()
+        # A full X.Y.Z: cwpilot takes only the 1.2 family (its newest patch, v1.2.5),
+        # hookrunner keeps the exact patch (v1.2.3).
+        self.set_rules([
+            {"match": "/releases", "action": "content",
+             "body": release_list_json(["v1.3.0", "v1.2.5", "v1.2.3"])},
+        ])
+        self.seed_cached_version("v1.2.5")
+        hr_dir = self.hookrunner_dir("v1.2.3")
+        hr_dir.mkdir(parents=True)
+        (hr_dir / "hookrunner").write_text("#!/bin/sh\n")
+        (hr_dir / "hookrunner.sig").write_text("sig")
+
+        result = self.run_install("1.2.3", everything=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("installed cwpilot v1.2.5", result.stdout)
+        self.assertIn("hookrunner v1.2.3", result.stdout)
+        self.assertTrue(self.stable_link().is_symlink())
+
+    def test_naming_cwpilot_does_not_install_hookrunner(self):
+        self.install_fake_curl()
+        self.set_rules([{"match": "", "action": "fail", "message": "network should not be used"}])
+        self.seed_cached_version("v1.2.3")
+
+        result = self.run_install("v1.2.3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("hookrunner", result.stdout)
+        self.assertFalse(self.hookrunner_dir("v1.2.3").exists())
+
     def test_hookrunner_bad_signature_installs_nothing(self):
         self.install_fake_curl()
         hr = self.make_signed_hookrunner("v1.2.0")
@@ -601,8 +656,8 @@ class InstallShTestCase(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.versions_dir() / "v2.0.0" / "cwpilot.sig").read_bytes(), release["sig"].read_bytes())
-        self.assertEqual(len(self.curl_calls()), 1)
-        self.assertTrue(self.curl_calls()[0].endswith(".sig"))
+        self.assertEqual(len(self.curl_calls()), 2)  # the family's release list, then the .sig
+        self.assertTrue(self.curl_calls()[-1].endswith(".sig"))
 
     def test_backfill_refuses_a_cached_binary_that_is_not_the_genuine_release(self):
         self.install_fake_curl()

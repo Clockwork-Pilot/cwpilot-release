@@ -536,6 +536,17 @@ install_cwpilot() {
 }
 
 
+# Warn (never fail) when the install prefix isn't on $PATH, so the user knows why a
+# freshly installed cwpilot/hookrunner "isn't found".
+check_path() {
+    case ":${PATH:-}:" in
+        *":${PREFIX%/}:"* | *":${PREFIX%/}/:"*) return 0 ;;
+    esac
+    echo "warning: ${PREFIX} is not in your \$PATH, so cwpilot and hookrunner won't be found by name." >&2
+    echo "         add it for this shell and future ones with:" >&2
+    echo "           echo 'export PATH=\"${PREFIX}:\$PATH\"' >> ~/.bashrc && export PATH=\"${PREFIX}:\$PATH\"" >&2
+}
+
 # ── Dispatch: no component named installs everything ─────────────────────────────
 case "$COMPONENT" in
     cwpilot)
@@ -558,3 +569,4 @@ case "$COMPONENT" in
         install_hookrunner ;;
 esac
 
+check_path

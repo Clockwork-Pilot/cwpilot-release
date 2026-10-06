@@ -9,6 +9,15 @@
 # can replace the binary can replace its checksum file too, but cannot forge a
 # signature without the private key. There is no flag to skip the signature check.
 #
+# The signature is EMBEDDED in each release binary, as a trailer at the very end of the
+# file (there is no separate .sig asset):
+#
+#     <payload> <signature: N bytes> <N: 4 bytes, big-endian> "CWPSIG01"
+#
+# and covers <payload> only. The installed file is the downloaded file, trailer included
+# (ELF/Mach-O loaders ignore trailing bytes), so it can be re-verified later, by the
+# plugin, from the binary alone. Writer: sign-embedded.sh in cwpilot / code-plugin.
+#
 # openssl specifically (not cosign, not anything else) because this script is piped
 # through `curl | sh` onto a bare machine with no install step of its own -- openssl
 # ships preinstalled on macOS and virtually every desktop Linux distro, so the
@@ -64,9 +73,9 @@ Name "cwpilot" or "hookrunner" to install only that one. ("--hookrunner VERSION"
 kept as an alias for "hookrunner VERSION".)
 
 cwpilot comes from the Clockwork-Pilot release assets. hookrunner comes from the
-plugin's releases and is stored, with its .sig, next to the cwpilot versions as
+plugin's releases and is stored next to the cwpilot versions as
 <versions dir>/hookrunner-v<VERSION>/hookrunner; the newest two such directories are
-kept. Both are verified against the same signature key. VERSION is resolved
+kept. Both carry an embedded signature, verified against the same key. VERSION is resolved
 independently in each repo, so it must exist in both when installing everything.
 
 VERSION defaults to "latest" when omitted (or CWPILOT_VERSION is unset), which
@@ -146,13 +155,16 @@ fetch() {
     fi
 }
 
-# Verify $1 (a file) against detached signature $2 with the embedded public key (or the
-# key file CWPILOT_SIGNING_PUBKEY names -- for testing against a self-signed release, or
-# after a key rotation lands upstream faster than this script does; it names a KEY FILE,
-# never disables the check). Exits the whole script on any failure: nothing unverified is
-# ever installed.
-verify_signature() {
-    vs_file="$1"; vs_sig="$2"
+TRAILER_MAGIC="CWPSIG01"
+TRAILER_FIXED_BYTES=12   # 4-byte length + 8-byte magic
+TRAILER_MAX_SIGNATURE_BYTES=1024
+
+# Sets SIGNING_KEY_FILE to the public key signatures are checked against: the embedded
+# one, or the key file CWPILOT_SIGNING_PUBKEY names -- for testing against a self-signed
+# release, or after a key rotation lands upstream faster than this script does; it names
+# a KEY FILE, never disables the check. The key is NOT stored anywhere afterwards: the
+# plugin carries its own copy, and nothing read back from the versions dir is trusted.
+signature_key_file() {
     command -v openssl >/dev/null 2>&1 || {
         echo "error: openssl is required to verify release signatures" >&2
         exit 1
@@ -163,37 +175,50 @@ verify_signature() {
             echo "error: CWPILOT_SIGNING_PUBKEY does not exist: ${CWPILOT_SIGNING_PUBKEY}" >&2
             exit 1
         }
-        vs_key="$CWPILOT_SIGNING_PUBKEY"
+        SIGNING_KEY_FILE="$CWPILOT_SIGNING_PUBKEY"
     else
-        vs_key="${tmpdir}/signing.pub"
-        printf '%s\n' "$PUBKEY_PEM" > "$vs_key"
+        SIGNING_KEY_FILE="${tmpdir}/signing.pub"
+        printf '%s\n' "$PUBKEY_PEM" > "$SIGNING_KEY_FILE"
     fi
-    if ! openssl dgst -sha256 -verify "$vs_key" -signature "$vs_sig" "$vs_file" >/dev/null 2>&1; then
-        echo "error: signature verification failed for $(basename "$vs_file") -- refusing to install" >&2
+}
+
+# Status 0 when $1 carries a well-formed embedded signature that verifies, 1 otherwise
+# (no trailer, a malformed one, or a bad signature). Never exits on a bad file, so a
+# caller can treat "not signed" as "not cached"; a missing trailer is a failure, never a
+# pass. Needs only tail, head, od, wc, cmp and openssl.
+signature_ok() {
+    so_file="$1"
+    signature_key_file
+    so_size="$(wc -c < "$so_file" | tr -d ' ')"
+    [ "$so_size" -gt "$TRAILER_FIXED_BYTES" ] || return 1
+    printf '%s' "$TRAILER_MAGIC" > "${tmpdir}/trailer.magic"
+    tail -c 8 "$so_file" | cmp -s - "${tmpdir}/trailer.magic" || return 1
+    # The length field: 4 bytes, big-endian, read as decimal bytes.
+    set -- $(tail -c "$TRAILER_FIXED_BYTES" "$so_file" | head -c 4 | od -An -tu1)
+    [ "$#" -eq 4 ] || return 1
+    so_siglen=$(( $1 * 16777216 + $2 * 65536 + $3 * 256 + $4 ))
+    [ "$so_siglen" -ge 1 ] && [ "$so_siglen" -le "$TRAILER_MAX_SIGNATURE_BYTES" ] || return 1
+    so_trailer=$(( so_siglen + TRAILER_FIXED_BYTES ))
+    [ "$so_trailer" -lt "$so_size" ] || return 1
+    tail -c "$so_trailer" "$so_file" | head -c "$so_siglen" > "${tmpdir}/embedded.sig"
+    head -c "$(( so_size - so_trailer ))" "$so_file" |
+        openssl dgst -sha256 -verify "$SIGNING_KEY_FILE" -signature "${tmpdir}/embedded.sig" >/dev/null 2>&1
+}
+
+# Verify the signature embedded in $1. Exits the whole script on any failure: nothing
+# unverified is ever installed.
+verify_signature() {
+    if ! signature_ok "$1"; then
+        echo "error: signature verification failed for $(basename "$1") -- refusing to install" >&2
         exit 1
     fi
 }
 
-# Keep the embedded public key at <versions dir>/signing.pub, beside the .sig files, so
-# anything that re-checks an installed binary later has the key without needing this
-# script. Rewritten on every run (so a rotation here reaches it) and atomically. Never
-# written from CWPILOT_SIGNING_PUBKEY: that override is for testing, and must not become
-# the stored trust root.
-store_public_key() {
-    [ -z "${CWPILOT_SIGNING_PUBKEY:-}" ] || return 0
-    mkdir -p "$VERSIONS_DIR"
-    key_tmp="${VERSIONS_DIR}/signing.pub.tmp.$$"
-    printf '%s\n' "$PUBKEY_PEM" > "$key_tmp"
-    chmod 0644 "$key_tmp"
-    mv -f "$key_tmp" "${VERSIONS_DIR}/signing.pub"
-}
-
 # ── hookrunner: a different binary from a different repo ────────────────────────
 # VERSION is resolved against the hookrunner repo the same way cwpilot's is (empty or
-# "latest", a bare major.minor, or an exact tag); the plugin passes an exact one. Both
-# files are downloaded and the signature is verified BEFORE anything lands in the
-# versions directory, and the .sig is stored beside the binary (written first, so a
-# binary is never present without its sig).
+# "latest", a bare major.minor, or an exact tag); the plugin passes an exact one. The
+# binary is downloaded and its embedded signature verified BEFORE anything lands in the
+# versions directory.
 resolve_hookrunner_tag() {
     spec="$1"
     case "$spec" in
@@ -249,24 +274,22 @@ install_hookrunner() {
     HOOKRUNNER_VERSION="$(resolve_hookrunner_tag "$HOOKRUNNER_VERSION")"
     hr_asset="hookrunner-${PLATFORM}"
     hr_dir="${VERSIONS_DIR}/hookrunner-${HOOKRUNNER_VERSION}"
-    if [ "$FORCE" -ne 1 ] && [ -f "${hr_dir}/hookrunner" ] && [ -f "${hr_dir}/hookrunner.sig" ]; then
-        store_public_key
+    # Installed means present AND carrying a valid embedded signature: a hookrunner from
+    # before signatures were embedded is fetched again, once.
+    if [ "$FORCE" -ne 1 ] && [ -f "${hr_dir}/hookrunner" ] && signature_ok "${hr_dir}/hookrunner"; then
         echo "hookrunner ${HOOKRUNNER_VERSION} (${PLATFORM}) already installed at ${hr_dir}/hookrunner"
         return 0
     fi
     ensure_tmpdir
     hr_url="${HOOKRUNNER_BASE_URL}/download/${HOOKRUNNER_VERSION}"
     fetch "hookrunner binary" "${hr_url}/${hr_asset}" "${tmpdir}/${hr_asset}"
-    fetch "hookrunner signature" "${hr_url}/${hr_asset}.sig" "${tmpdir}/${hr_asset}.sig"
-    verify_signature "${tmpdir}/${hr_asset}" "${tmpdir}/${hr_asset}.sig"
+    verify_signature "${tmpdir}/${hr_asset}"
 
     mkdir -p "$hr_dir"
     cache_tmp="${hr_dir}/hookrunner.tmp.$$"
-    cp "${tmpdir}/${hr_asset}.sig" "${hr_dir}/hookrunner.sig"
     cp "${tmpdir}/${hr_asset}" "$cache_tmp"
     chmod 0755 "$cache_tmp"
     mv -f "$cache_tmp" "${hr_dir}/hookrunner"
-    store_public_key
     echo "installed hookrunner ${HOOKRUNNER_VERSION} (${PLATFORM}) to ${hr_dir}/hookrunner"
 
     # Keep the two most recently installed hookrunner versions: current + one to roll
@@ -398,23 +421,11 @@ install_cwpilot() {
     # A previous version rejected an existing destination with "already exists (use
     # --force)". The cache is now keyed by (resolved) version, so a cached release can be
     # reused and the stable link below can always move to the requested version.
-    if [ "$FORCE" -ne 1 ] && [ -f "$cached_binary" ]; then
+    # A cached binary is reused only while it still carries a valid embedded signature:
+    # one from before signatures were embedded (or one that no longer verifies) is
+    # downloaded and verified again rather than trusted.
+    if [ "$FORCE" -ne 1 ] && [ -f "$cached_binary" ] && signature_ok "$cached_binary"; then
         chmod 0755 "$cached_binary"
-        # A version cached before signatures were kept has no cwpilot.sig, and the plugin
-        # treats a binary with no signature as unverified. Backfill it WITHOUT re-downloading
-        # the binary: fetch the release's .sig and verify the cached file against it first,
-        # so a cached binary that is not the genuine release is refused, never blessed.
-        if [ ! -f "${cwpilot_version}/cwpilot.sig" ]; then
-            command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
-            ensure_tmpdir
-            backfill_sig="${tmpdir}/${ASSET}.sig"
-            fetch "release signature" "${RELEASE_URL}/${ASSET}.sig" "$backfill_sig"
-            if ! verify_signature "$cached_binary" "$backfill_sig"; then
-                exit 1
-            fi
-            cp "$backfill_sig" "${cwpilot_version}/cwpilot.sig"
-            echo "stored the missing signature for cached cwpilot ${VERSION}"
-        fi
     else
         command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
         if command -v sha256sum >/dev/null 2>&1; then
@@ -453,14 +464,12 @@ install_cwpilot() {
 
         ensure_tmpdir
         binary="${tmpdir}/${ASSET}"
-        signature="${tmpdir}/${ASSET}.sig"
         fetch "release binary" "${RELEASE_URL}/${ASSET}" "$binary"
-        fetch "release signature" "${RELEASE_URL}/${ASSET}.sig" "$signature"
 
         # GitHub computes and stores a sha256 "digest" for every uploaded release asset --
         # it's already in the release, so there's no need to also publish (and fetch) a
         # separate *.sha256 sidecar file. The digest is only exposed through the REST API,
-        # not the plain releases/download/... URLs used above for the binary and signature.
+        # not the plain releases/download/... URL used above for the binary.
         # When VERSION was resolved from "latest" above, that request already pulled this
         # same release's metadata -- reuse it instead of asking the API twice.
         if [ -n "$prefetched_metadata" ]; then
@@ -481,18 +490,15 @@ install_cwpilot() {
             exit 1
         }
 
-        verify_signature "$binary" "$signature"
+        verify_signature "$binary"
 
         chmod 0755 "$binary"
-        # The signature is kept beside the binary (written first, so a binary is never
-        # present without its sig) for anything that wants to re-check it later.
-        cp "$signature" "${cwpilot_version}/cwpilot.sig"
+        # The embedded signature travels with the file, so anything can re-check it later.
         cache_tmp="${cached_binary}.tmp.$$"
         cp "$binary" "$cache_tmp"
         chmod 0755 "$cache_tmp"
         mv -f "$cache_tmp" "$cached_binary"
     fi
-    store_public_key
 
     # Capture what the stable link currently points at, BEFORE it moves, so it can be kept
     # as the rollback fallback below. Only trusted when it actually points inside

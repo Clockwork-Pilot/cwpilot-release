@@ -27,7 +27,7 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 REQUIRED_TOOLS = [
     "sh", "uname", "tr", "mkdir", "chmod", "sha256sum", "shasum", "openssl",
     "awk", "mktemp", "cp", "mv", "rm", "ln", "cat", "printf", "dirname",
-    "readlink", "basename", "ls", "tail",
+    "readlink", "basename", "ls", "tail", "head", "od", "wc", "cmp",
 ]
 
 FAKE_CURL_SCRIPT = """
@@ -95,6 +95,28 @@ PLATFORM = detect_platform()
 ASSET = f"cwpilot-{PLATFORM}"
 
 
+TRAILER_MAGIC = b"CWPSIG01"
+
+
+def make_keypair(directory: Path, name: str):
+    priv, pub = directory / f"{name}-priv.pem", directory / f"{name}-pub.pem"
+    subprocess.run(["openssl", "genrsa", "-out", str(priv), "2048"], check=True, capture_output=True)
+    subprocess.run(["openssl", "rsa", "-in", str(priv), "-pubout", "-out", str(pub)], check=True, capture_output=True)
+    return priv, pub
+
+
+def signed_bytes(content: bytes, priv: Path, directory: Path) -> bytes:
+    """`content` with an RSA-SHA256 signature appended as a trailer, written independently
+    of the real signer (sign-embedded.sh) so the two cannot share a bug:
+    <payload> <signature> <4-byte big-endian length> CWPSIG01."""
+    payload, sig = directory / "payload.tmp", directory / "payload.sig.tmp"
+    payload.write_bytes(content)
+    subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(priv), "-out", str(sig), str(payload)],
+                   check=True, capture_output=True)
+    signature = sig.read_bytes()
+    return content + signature + len(signature).to_bytes(4, "big") + TRAILER_MAGIC
+
+
 def release_json(tag_name: str, asset_name: str, digest_hex: str) -> str:
     return json.dumps(
         {"tag_name": tag_name, "assets": [{"name": asset_name, "digest": f"sha256:{digest_hex}"}]},
@@ -124,6 +146,10 @@ class InstallShTestCase(unittest.TestCase):
             found = shutil.which(name)
             if found:
                 os.symlink(found, self.toolbin / name)
+
+        # The key seeded (already-installed) binaries are signed with; run_install trusts
+        # it unless a test names another, so a cache hit is a genuinely verified one.
+        self.cache_priv, self.cache_pub = make_keypair(self.work, "cache")
 
         self.rules_file = self.work / "curl_rules.json"
         self.rules_file.write_text("[]")
@@ -158,15 +184,14 @@ class InstallShTestCase(unittest.TestCase):
         return [line for line in self.log_file.read_text().splitlines() if line]
 
     def seed_cached_version(self, version: str, content: bytes = b"#!/bin/sh\necho cached\n",
-                            with_sig: bool = True):
+                            signed: bool = True):
+        """An installed cwpilot. Signed (embedded trailer, under the cache key) unless
+        `signed` is False -- an install from before signatures were embedded."""
         version_dir = self.home / ".local" / "share" / "cwpilot-versions" / version
         version_dir.mkdir(parents=True)
         binary = version_dir / "cwpilot"
-        binary.write_bytes(content)
+        binary.write_bytes(signed_bytes(content, self.cache_priv, self.work) if signed else content)
         binary.chmod(0o755)
-        if with_sig:
-            # Any content: a cache hit with a sig present never re-verifies or goes online.
-            (version_dir / "cwpilot.sig").write_bytes(b"stored-sig")
         return binary
 
     def _as_cwpilot_family(self, args):
@@ -189,6 +214,7 @@ class InstallShTestCase(unittest.TestCase):
 
     def run_install(self, *args, extra_env=None, everything=False):
         env = dict(self.env)
+        env["CWPILOT_SIGNING_PUBKEY"] = str(self.cache_pub)
         if extra_env:
             env.update(extra_env)
         # A bare install.sh now installs cwpilot AND hookrunner; the cwpilot-focused
@@ -220,24 +246,20 @@ class InstallShTestCase(unittest.TestCase):
         tags-API URLs are keyed on the literal tag, v and all."""
         assert tag.startswith("v"), "GitHub tags in this repo are v-prefixed"
 
-        priv = self.work / f"{tag}-priv.pem"
-        pub = self.work / f"{tag}-pub.pem"
+        priv, pub = make_keypair(self.work, tag)
         binary = self.work / f"{tag}-{ASSET}"
-        sig = self.work / f"{tag}-{ASSET}.sig"
 
-        binary.write_bytes(content)
-        subprocess.run(["openssl", "genrsa", "-out", str(priv), "2048"], check=True, capture_output=True)
-        subprocess.run(["openssl", "rsa", "-in", str(priv), "-pubout", "-out", str(pub)], check=True, capture_output=True)
-        subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", str(priv), "-out", str(sig), str(binary)],
-            check=True, capture_output=True,
-        )
-        digest = hashlib.sha256(content).hexdigest()
+        # What the release workflow publishes: the binary WITH its signature embedded.
+        # The digest GitHub reports is over that published file.
+        published = signed_bytes(content, priv, self.work)
+        binary.write_bytes(published)
+        digest = hashlib.sha256(published).hexdigest()
         return {
             "tag": tag,
             "pub": pub,
+            "priv": priv,
             "binary": binary,
-            "sig": sig,
+            "content": content,
             "digest": digest,
             "metadata_rule": {
                 "match": "releases/latest",
@@ -249,9 +271,6 @@ class InstallShTestCase(unittest.TestCase):
                 "action": "content",
                 "body": release_json(tag, ASSET, digest),
             },
-            # Order matters: the .sig rule must be checked before the plain binary
-            # rule, since its URL is a superset match of the binary URL's suffix.
-            "binary_rule": {"match": f"download/{tag}/{ASSET}.sig", "action": "copy", "src": str(sig)},
             "download_rule": {"match": f"download/{tag}/{ASSET}", "action": "copy", "src": str(binary)},
         }
 
@@ -315,7 +334,7 @@ class InstallShTestCase(unittest.TestCase):
     def test_latest_cold_download_verifies_and_caches_under_resolved_tag(self):
         self.install_fake_curl()
         release = self.make_signed_release("v2.0.0", content=b"#!/bin/sh\necho fresh-2.0.0\n")
-        self.set_rules([release["metadata_rule"], release["binary_rule"], release["download_rule"]])
+        self.set_rules([release["metadata_rule"], release["download_rule"]])
 
         result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
 
@@ -330,7 +349,7 @@ class InstallShTestCase(unittest.TestCase):
     def test_second_latest_run_same_tag_reuses_cache_without_redownload(self):
         self.install_fake_curl()
         release = self.make_signed_release("v2.0.0", content=b"#!/bin/sh\necho fresh-2.0.0\n")
-        self.set_rules([release["metadata_rule"], release["binary_rule"], release["download_rule"]])
+        self.set_rules([release["metadata_rule"], release["download_rule"]])
         first = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
         self.assertEqual(first.returncode, 0, first.stderr)
 
@@ -353,7 +372,7 @@ class InstallShTestCase(unittest.TestCase):
             "action": "content",
             "body": release_json("v3.0.0", ASSET, "0" * 64),  # wrong digest
         }
-        self.set_rules([bad_metadata, release["binary_rule"], release["download_rule"]])
+        self.set_rules([bad_metadata, release["download_rule"]])
 
         result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
 
@@ -373,7 +392,7 @@ class InstallShTestCase(unittest.TestCase):
         other_priv = self.work / "other-priv.pem"
         subprocess.run(["openssl", "genrsa", "-out", str(other_priv), "2048"], check=True, capture_output=True)
         subprocess.run(["openssl", "rsa", "-in", str(other_priv), "-pubout", "-out", str(other_pub)], check=True, capture_output=True)
-        self.set_rules([release["metadata_rule"], release["binary_rule"], release["download_rule"]])
+        self.set_rules([release["metadata_rule"], release["download_rule"]])
 
         result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(other_pub)})
 
@@ -385,7 +404,7 @@ class InstallShTestCase(unittest.TestCase):
         self.install_fake_curl()
         self.seed_cached_version("v1.5.0", content=b"#!/bin/sh\necho stale\n")
         release = self.make_signed_release("v1.5.0", content=b"#!/bin/sh\necho refreshed\n")
-        self.set_rules([release["tags_rule"], release["binary_rule"], release["download_rule"]])
+        self.set_rules([release["tags_rule"], release["download_rule"]])
 
         # Bare "1.5.0" on top of --force also proves normalization still applies
         # when the cache-hit shortcut is bypassed.
@@ -393,7 +412,8 @@ class InstallShTestCase(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = self.versions_dir() / "v1.5.0" / "cwpilot"
-        self.assertEqual(installed.read_bytes(), b"#!/bin/sh\necho refreshed\n")
+        self.assertEqual(installed.read_bytes(), release["binary"].read_bytes())
+        self.assertTrue(installed.read_bytes().startswith(b"#!/bin/sh\necho refreshed\n"))
         self.assertGreaterEqual(len(self.curl_calls()), 2, "--force must hit the network even on a cache hit")
 
     def test_rejects_path_traversal_version(self):
@@ -468,7 +488,7 @@ class InstallShTestCase(unittest.TestCase):
         self.seed_cached_version("v0.5.0", content=b"#!/bin/sh\necho orphan\n")
 
         release_a = self.make_signed_release("v1.0.0", content=b"#!/bin/sh\necho a\n")
-        self.set_rules([release_a["tags_rule"], release_a["binary_rule"], release_a["download_rule"]])
+        self.set_rules([release_a["tags_rule"], release_a["download_rule"]])
         first = self.run_install("v1.0.0", extra_env={"CWPILOT_SIGNING_PUBKEY": str(release_a["pub"])})
         self.assertEqual(first.returncode, 0, first.stderr)
         # Nothing to prune yet -- no stable link existed before this run, so there
@@ -478,7 +498,7 @@ class InstallShTestCase(unittest.TestCase):
         )
 
         release_b = self.make_signed_release("v2.0.0", content=b"#!/bin/sh\necho b\n")
-        self.set_rules([release_b["tags_rule"], release_b["binary_rule"], release_b["download_rule"]])
+        self.set_rules([release_b["tags_rule"], release_b["download_rule"]])
         second = self.run_install("v2.0.0", extra_env={"CWPILOT_SIGNING_PUBKEY": str(release_b["pub"])})
         self.assertEqual(second.returncode, 0, second.stderr)
 
@@ -491,12 +511,12 @@ class InstallShTestCase(unittest.TestCase):
     def test_force_reinstall_of_same_version_prunes_nothing_extra(self):
         self.install_fake_curl()
         release = self.make_signed_release("v1.5.0", content=b"#!/bin/sh\necho first\n")
-        self.set_rules([release["tags_rule"], release["binary_rule"], release["download_rule"]])
+        self.set_rules([release["tags_rule"], release["download_rule"]])
         first = self.run_install("v1.5.0", extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
         self.assertEqual(first.returncode, 0, first.stderr)
 
         refreshed = self.make_signed_release("v1.5.0", content=b"#!/bin/sh\necho refreshed\n")
-        self.set_rules([refreshed["tags_rule"], refreshed["binary_rule"], refreshed["download_rule"]])
+        self.set_rules([refreshed["tags_rule"], refreshed["download_rule"]])
         second = self.run_install(
             "v1.5.0", "--force", extra_env={"CWPILOT_SIGNING_PUBKEY": str(refreshed["pub"])},
         )
@@ -515,28 +535,24 @@ class InstallShTestCase(unittest.TestCase):
 
     def make_signed_hookrunner(self, tag: str, content: bytes = b"#!/bin/sh\necho hookrunner\n"):
         asset = f"hookrunner-{PLATFORM}"
-        priv = self.work / f"hr-{tag}-priv.pem"
-        pub = self.work / f"hr-{tag}-pub.pem"
+        priv, pub = make_keypair(self.work, f"hr-{tag}")
         binary = self.work / f"hr-{tag}-{asset}"
-        sig = self.work / f"hr-{tag}-{asset}.sig"
-        binary.write_bytes(content)
-        subprocess.run(["openssl", "genrsa", "-out", str(priv), "2048"], check=True, capture_output=True)
-        subprocess.run(["openssl", "rsa", "-in", str(priv), "-pubout", "-out", str(pub)], check=True, capture_output=True)
-        subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(priv), "-out", str(sig), str(binary)],
-                       check=True, capture_output=True)
+        binary.write_bytes(signed_bytes(content, priv, self.work))
         return {
-            "pub": pub, "binary": binary, "sig": sig,
-            # .sig rule first: its URL also matches the plain-binary rule's substring.
-            "rules": [
-                {"match": f"download/{tag}/{asset}.sig", "action": "copy", "src": str(sig)},
-                {"match": f"download/{tag}/{asset}", "action": "copy", "src": str(binary)},
-            ],
+            "pub": pub, "binary": binary,
+            "rules": [{"match": f"download/{tag}/{asset}", "action": "copy", "src": str(binary)}],
         }
 
     def hookrunner_dir(self, tag: str) -> Path:
         return self.versions_dir() / f"hookrunner-{tag}"
 
-    def test_hookrunner_installs_verified_binary_and_sig_without_the_api(self):
+    def seed_hookrunner(self, tag: str, signed: bool = True, content: bytes = b"#!/bin/sh\necho hookrunner\n"):
+        d = self.hookrunner_dir(tag)
+        d.mkdir(parents=True)
+        (d / "hookrunner").write_bytes(signed_bytes(content, self.cache_priv, self.work) if signed else content)
+        return d
+
+    def test_hookrunner_installs_verified_binary_without_the_api(self):
         self.install_fake_curl()
         hr = self.make_signed_hookrunner("v1.2.0")
         self.set_rules(hr["rules"])
@@ -547,7 +563,8 @@ class InstallShTestCase(unittest.TestCase):
         d = self.hookrunner_dir("v1.2.0")
         self.assertEqual((d / "hookrunner").read_bytes(), hr["binary"].read_bytes())
         self.assertTrue(os.access(d / "hookrunner", os.X_OK))
-        self.assertEqual((d / "hookrunner.sig").read_bytes(), hr["sig"].read_bytes())
+        self.assertEqual(sorted(p.name for p in d.iterdir()), ["hookrunner"], "no detached .sig is written")
+        self.assertEqual([c for c in self.curl_calls() if c.endswith(".sig")], [], "no .sig is fetched")
         self.assertFalse(any("api.github.com" in c for c in self.curl_calls()))
         self.assertFalse(self.stable_link().exists(), "hookrunner mode must not touch the cwpilot link")
 
@@ -560,10 +577,7 @@ class InstallShTestCase(unittest.TestCase):
              "body": release_list_json(["v1.3.0", "v1.2.5", "v1.2.3"])},
         ])
         self.seed_cached_version("v1.2.5")
-        hr_dir = self.hookrunner_dir("v1.2.3")
-        hr_dir.mkdir(parents=True)
-        (hr_dir / "hookrunner").write_text("#!/bin/sh\n")
-        (hr_dir / "hookrunner.sig").write_text("sig")
+        self.seed_hookrunner("v1.2.3")
 
         result = self.run_install("1.2.3", everything=True)
 
@@ -598,15 +612,24 @@ class InstallShTestCase(unittest.TestCase):
     def test_hookrunner_already_installed_stays_offline(self):
         self.install_fake_curl()
         self.set_rules([{"match": "", "action": "fail", "message": "network should not be used"}])
-        d = self.hookrunner_dir("v1.2.0")
-        d.mkdir(parents=True)
-        (d / "hookrunner").write_bytes(b"x")
-        (d / "hookrunner.sig").write_bytes(b"x")
+        self.seed_hookrunner("v1.2.0")
 
         result = self.run_install("--hookrunner", "v1.2.0")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.curl_calls(), [])
+
+    def test_hookrunner_without_an_embedded_signature_is_fetched_again(self):
+        """An install from before signatures were embedded is not trusted as cached."""
+        self.install_fake_curl()
+        self.seed_hookrunner("v1.2.0", signed=False)
+        hr = self.make_signed_hookrunner("v1.2.0")
+        self.set_rules(hr["rules"])
+
+        result = self.run_install("--hookrunner", "v1.2.0", extra_env={"CWPILOT_SIGNING_PUBKEY": str(hr["pub"])})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.hookrunner_dir("v1.2.0") / "hookrunner").read_bytes(), hr["binary"].read_bytes())
 
     def test_hookrunner_on_an_unbuilt_platform_says_so_without_downloading(self):
         self.install_fake_curl()
@@ -645,45 +668,106 @@ class InstallShTestCase(unittest.TestCase):
         names = sorted(p.name for p in self.versions_dir().iterdir())
         self.assertEqual(names, ["hookrunner-v1.1.0", "hookrunner-v1.2.0"])
 
-    def test_cached_version_without_a_sig_gets_it_backfilled_without_redownloading(self):
+    def test_cached_version_without_an_embedded_signature_is_downloaded_again(self):
+        """An install from before signatures were embedded is not blessed: it is replaced
+        by a verified download."""
         self.install_fake_curl()
         release = self.make_signed_release("v2.0.0", content=b"#!/bin/sh\necho genuine\n")
-        self.seed_cached_version("v2.0.0", content=release["binary"].read_bytes(), with_sig=False)
-        self.set_rules([release["binary_rule"], {"match": f"download/v2.0.0/{ASSET}", "action": "fail",
-                                                  "message": "binary must not be re-downloaded"}])
+        self.seed_cached_version("v2.0.0", content=release["content"], signed=False)
+        self.set_rules([release["tags_rule"], release["download_rule"]])
 
         result = self.run_install("v2.0.0", extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.versions_dir() / "v2.0.0" / "cwpilot.sig").read_bytes(), release["sig"].read_bytes())
-        self.assertEqual(len(self.curl_calls()), 2)  # the family's release list, then the .sig
-        self.assertTrue(self.curl_calls()[-1].endswith(".sig"))
+        self.assertEqual((self.versions_dir() / "v2.0.0" / "cwpilot").read_bytes(), release["binary"].read_bytes())
 
-    def test_backfill_refuses_a_cached_binary_that_is_not_the_genuine_release(self):
+    def test_cached_tampered_binary_is_never_reused(self):
         self.install_fake_curl()
         release = self.make_signed_release("v2.0.0", content=b"#!/bin/sh\necho genuine\n")
-        self.seed_cached_version("v2.0.0", content=b"#!/bin/sh\necho tampered\n", with_sig=False)
-        self.set_rules([release["binary_rule"]])
+        cached = self.seed_cached_version("v2.0.0", content=b"#!/bin/sh\necho tampered\n")
+        # Signed by the cache key, but the install trusts only the release key: the
+        # cached file does not verify, so it must be replaced, not linked.
+        self.set_rules([release["tags_rule"], {"match": f"download/v2.0.0/{ASSET}", "action": "fail",
+                                                "message": "404"}])
 
         result = self.run_install("v2.0.0", extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("signature verification failed", result.stderr)
-        self.assertFalse((self.versions_dir() / "v2.0.0" / "cwpilot.sig").exists())
-        self.assertFalse(self.stable_link().exists(), "a refused binary must not become the stable link")
+        self.assertFalse(self.stable_link().exists(), "an unverified binary must not become the stable link")
+        self.assertIn(b"tampered", cached.read_bytes())  # untouched; nothing replaced it
 
-    def test_embedded_public_key_is_stored_in_versions_dir(self):
+    def test_a_download_without_an_embedded_signature_is_rejected(self):
         self.install_fake_curl()
-        self.set_rules([{"match": "", "action": "fail", "message": "network should not be used"}])
-        self.seed_cached_version("v1.2.3")
+        release = self.make_signed_release("v2.0.0")
+        unsigned = self.work / "unsigned"
+        unsigned.write_bytes(release["content"])
+        self.set_rules([
+            {"match": "releases/latest", "action": "content",
+             "body": release_json("v2.0.0", ASSET, hashlib.sha256(release["content"]).hexdigest())},
+            {"match": f"download/v2.0.0/{ASSET}", "action": "copy", "src": str(unsigned)},
+        ])
 
-        result = self.run_install("v1.2.3")
+        result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("signature verification failed", result.stderr)
+        self.assertFalse((self.versions_dir() / "v2.0.0" / "cwpilot").exists())
+
+    def test_a_tampered_or_damaged_trailer_is_rejected(self):
+        release = self.make_signed_release("v2.0.0")
+        good = release["binary"].read_bytes()
+        damaged = {
+            "payload flipped": bytes([good[0] ^ 0xFF]) + good[1:],
+            "signature flipped": good[:-30] + bytes([good[-30] ^ 0xFF]) + good[-29:],
+            "truncated": good[:-5],
+            "junk appended": good + b"junk",
+            "absurd length": good[:-12] + (0xFFFFFFFF).to_bytes(4, "big") + TRAILER_MAGIC,
+        }
+        for name, content in damaged.items():
+            with self.subTest(case=name):
+                self.install_fake_curl()
+                bad = self.work / "damaged"
+                bad.write_bytes(content)
+                self.set_rules([
+                    {"match": "releases/latest", "action": "content",
+                     "body": release_json("v2.0.0", ASSET, hashlib.sha256(content).hexdigest())},
+                    {"match": f"download/v2.0.0/{ASSET}", "action": "copy", "src": str(bad)},
+                ])
+                result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("signature verification failed", result.stderr)
+                self.assertFalse((self.versions_dir() / "v2.0.0" / "cwpilot").exists())
+
+    def test_the_embedded_key_is_used_when_no_override_is_given(self):
+        """No CWPILOT_SIGNING_PUBKEY: only the embedded release key counts, so a binary
+        signed by any other key is refused."""
+        self.install_fake_curl()
+        release = self.make_signed_release("v2.0.0")
+        self.set_rules([release["metadata_rule"], release["download_rule"]])
+
+        result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": ""})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("signature verification failed", result.stderr)
+
+    def test_embedded_public_key_matches_signing_pub(self):
+        text = INSTALL_SH.read_text()
+        start = text.index("PUBKEY_PEM='") + len("PUBKEY_PEM='")
+        embedded = text[start:text.index("'", start)]
+        self.assertEqual(embedded.strip(), (REPO_ROOT / "signing.pub").read_text().strip(),
+                         "keep install.sh's embedded key and signing.pub in sync")
+
+    def test_nothing_is_written_beside_the_binaries_but_the_binaries(self):
+        """No signing.pub and no .sig: nothing in the versions dir is a trust input."""
+        self.install_fake_curl()
+        release = self.make_signed_release("v2.0.0")
+        self.set_rules([release["metadata_rule"], release["download_rule"]])
+
+        result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        stored = self.versions_dir() / "signing.pub"
-        self.assertEqual(stored.read_text().strip(), (REPO_ROOT / "signing.pub").read_text().strip(),
-                         "stored key must be the one install.sh embeds (kept in sync with signing.pub)")
-        self.assertEqual(sorted(p.name for p in self.versions_dir().iterdir()), ["signing.pub", "v1.2.3"])
+        self.assertEqual(sorted(p.name for p in self.versions_dir().iterdir()), ["v2.0.0"])
+        self.assertEqual(sorted(p.name for p in (self.versions_dir() / "v2.0.0").iterdir()), ["cwpilot"])
 
     def test_override_key_is_never_stored_as_the_trust_root(self):
         self.install_fake_curl()
@@ -695,7 +779,7 @@ class InstallShTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.versions_dir() / "signing.pub").exists())
 
-    def test_cwpilot_install_keeps_sig_and_does_not_prune_hookrunner(self):
+    def test_cwpilot_install_does_not_prune_hookrunner(self):
         self.install_fake_curl()
         hr_dir = self.hookrunner_dir("v1.2.0")
         hr_dir.mkdir(parents=True)
@@ -704,12 +788,11 @@ class InstallShTestCase(unittest.TestCase):
         self.stable_link().parent.mkdir(parents=True)
         os.symlink(self.versions_dir() / "v0.9.0" / "cwpilot", self.stable_link())
         release = self.make_signed_release("v2.0.0")
-        self.set_rules([release["metadata_rule"], release["binary_rule"], release["download_rule"]])
+        self.set_rules([release["metadata_rule"], release["download_rule"]])
 
         result = self.run_install(extra_env={"CWPILOT_SIGNING_PUBKEY": str(release["pub"])})
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.versions_dir() / "v2.0.0" / "cwpilot.sig").read_bytes(), release["sig"].read_bytes())
         self.assertTrue((hr_dir / "hookrunner").exists(), "cwpilot retention must not delete hookrunner")
 
 
